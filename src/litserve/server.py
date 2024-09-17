@@ -38,7 +38,7 @@ from starlette.middleware.gzip import GZipMiddleware
 
 from litserve import LitAPI
 from litserve.connector import _Connector
-from litserve.loops import inference_worker
+from litserve.loops import inference_worker, preprocess_worker
 from litserve.specs import OpenAISpec
 from litserve.specs.base import LitSpec
 from litserve.utils import LitAPIStatus, MaxSizeMiddleware, load_and_raise
@@ -114,6 +114,7 @@ class LitServer:
         spec: Optional[LitSpec] = None,
         max_payload_size=None,
         middlewares: Optional[list[Union[Callable, tuple[Callable, dict]]]] = None,
+        num_preprocess_workers: int = None,
     ):
         if batch_timeout > timeout and timeout not in (False, -1):
             raise ValueError("batch_timeout must be less than timeout")
@@ -157,6 +158,7 @@ class LitServer:
         self.app.response_queue_id = None
         self.response_queue_id = None
         self.response_buffer = {}
+        self.num_preprocess_workers = num_preprocess_workers
         # gzip does not play nicely with streaming, see https://github.com/tiangolo/fastapi/discussions/8448
         if not stream:
             middlewares.append((GZipMiddleware, {"minimum_size": 1000}))
@@ -196,7 +198,8 @@ class LitServer:
                 device_list = range(devices)
             self.devices = [self.device_identifiers(accelerator, device) for device in device_list]
 
-        self.workers = self.devices * self.workers_per_device
+        self.inference_workers = self.devices * self.workers_per_device
+
         self.setup_server()
 
     def launch_inference_worker(self, num_uvicorn_servers: int):
@@ -220,30 +223,101 @@ class LitServer:
                 raise e
 
         process_list = []
-        for worker_id, device in enumerate(self.devices * self.workers_per_device):
-            if len(device) == 1:
-                device = device[0]
 
-            self.workers_setup_status[worker_id] = False
+        def has_preprocess_method_override(api_instance):
+            # Check if preprocess is implemented by the user
+            if hasattr(api_instance, "preprocess"):
+                return api_instance.preprocess.__code__ is not LitAPI.preprocess.__code__
+            # If preprocess method does not exist in the subclass
+            return False
 
-            ctx = mp.get_context("spawn")
-            process = ctx.Process(
-                target=inference_worker,
-                args=(
-                    self.lit_api,
-                    self.lit_spec,
-                    device,
-                    worker_id,
-                    self.request_queue,
-                    self.response_queues,
-                    self.max_batch_size,
-                    self.batch_timeout,
-                    self.stream,
-                    self.workers_setup_status,
-                ),
-            )
-            process.start()
-            process_list.append(process)
+        enable_process_worker = has_preprocess_method_override(self.lit_api)
+        logger.debug("override lit_api.preprocess method: ", enable_process_worker)
+
+        if enable_process_worker:
+            if self.num_preprocess_workers:
+                pass
+            else:
+                logger.info("Using Workers per device as number of preprocess workers")
+                self.num_preprocess_workers = self.workers_per_device
+
+            self.preprocess_workers = self.devices * self.num_preprocess_workers
+            self.preprocess_queue = manager.Queue()
+
+            for worker_id, device in enumerate(self.preprocess_workers):
+                if len(device) == 1:
+                    device = device[0]
+
+                worker_id = f"preprocess_{worker_id}"
+                ctx = mp.get_context("spawn")
+                process = ctx.Process(
+                    target=preprocess_worker,
+                    args=(
+                        self.lit_api,
+                        self.lit_spec,
+                        device,
+                        worker_id,
+                        self.request_queue,
+                        self.preprocess_queue,
+                        self.response_queues,
+                        self.max_batch_size,
+                        self.batch_timeout,
+                    ),
+                )
+                process.start()
+                process_list.append(process)
+
+            for worker_id, device in enumerate(self.inference_workers):
+                if len(device) == 1:
+                    device = device[0]
+                worker_id = f"inference_{worker_id}"
+                self.workers_setup_status[worker_id] = False
+                ctx = mp.get_context("spawn")
+                process = ctx.Process(
+                    target=inference_worker,
+                    args=(
+                        self.lit_api,
+                        self.lit_spec,
+                        device,
+                        worker_id,
+                        self.request_queue,
+                        self.preprocess_queue,
+                        self.response_queues,
+                        self.max_batch_size,
+                        self.batch_timeout,
+                        self.stream,
+                        self.workers_setup_status,
+                    ),
+                )
+                process.start()
+                process_list.append(process)
+        else:
+            for worker_id, device in enumerate(self.inference_workers):
+                self.preprocess_queue = None
+                if len(device) == 1:
+                    device = device[0]
+                worker_id = f"inference_{worker_id}"
+                self.workers_setup_status[worker_id] = False
+                ctx = mp.get_context("spawn")
+                process = ctx.Process(
+                    target=inference_worker,
+                    args=(
+                        self.lit_api,
+                        self.lit_spec,
+                        device,
+                        worker_id,
+                        self.request_queue,
+                        self.preprocess_queue,
+                        self.response_queues,
+                        self.max_batch_size,
+                        self.batch_timeout,
+                        self.stream,
+                        self.workers_setup_status,
+                    ),
+                )
+                process.start()
+                process_list.append(process)
+
         return manager, process_list
 
     @asynccontextmanager
@@ -258,7 +332,7 @@ class LitServer:
             )
 
         response_queue = self.response_queues[app.response_queue_id]
-        response_executor = ThreadPoolExecutor(max_workers=len(self.devices * self.workers_per_device))
+        response_executor = ThreadPoolExecutor(max_workers=len(self.inference_workers))
         future = response_queue_to_buffer(response_queue, self.response_buffer, self.stream, response_executor)
         task = loop.create_task(future)
 
@@ -420,7 +494,7 @@ class LitServer:
         sockets = [config.bind_socket()]
 
         if num_api_servers is None:
-            num_api_servers = len(self.workers)
+            num_api_servers = len(self.inference_workers)
 
         if num_api_servers < 1:
             raise ValueError("num_api_servers must be greater than 0")
