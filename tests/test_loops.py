@@ -99,10 +99,16 @@ def test_streaming_loop():
     requests_queue = Queue()
     requests_queue.put((0, "UUID-1234", time.monotonic(), {"prompt": "Hello"}))
     response_queues = [FakeStreamResponseQueue(num_streamed_outputs)]
+    request_evicted_status = {}
 
     with pytest.raises(StopIteration, match="exit loop"):
         run_streaming_loop(
-            fake_stream_api, fake_stream_api, requests_queue, response_queues, callback_runner=NOOP_CB_RUNNER
+            fake_stream_api,
+            fake_stream_api,
+            requests_queue,
+            response_queues,
+            request_evicted_status,
+            callback_runner=NOOP_CB_RUNNER,
         )
 
     fake_stream_api.predict.assert_called_once_with("Hello")
@@ -182,6 +188,7 @@ def test_inference_worker(mock_single_loop, mock_batched_loop):
         batch_timeout=0,
         stream=False,
         workers_setup_status={},
+        request_evicted_status={},
         callback_runner=NOOP_CB_RUNNER,
     )
     mock_batched_loop.assert_called_once()
@@ -192,6 +199,7 @@ def test_inference_worker(mock_single_loop, mock_batched_loop):
         batch_timeout=0,
         stream=False,
         workers_setup_status={},
+        request_evicted_status={},
         callback_runner=NOOP_CB_RUNNER,
     )
     mock_single_loop.assert_called_once()
@@ -322,10 +330,12 @@ def test_run_streaming_loop():
     request_queue = Queue()
     request_queue.put((0, "UUID-001", time.monotonic(), {"input": "Hello"}))
     response_queues = [Queue()]
+    request_evicted_status = {}
 
     # Run the loop in a separate thread to allow it to be stopped
     loop_thread = threading.Thread(
-        target=run_streaming_loop, args=(lit_api, None, request_queue, response_queues, NOOP_CB_RUNNER)
+        target=run_streaming_loop,
+        args=(lit_api, None, request_queue, response_queues, request_evicted_status, NOOP_CB_RUNNER),
     )
     loop_thread.start()
 
@@ -350,10 +360,12 @@ def test_run_streaming_loop_timeout(caplog):
     request_queue = Queue()
     request_queue.put((0, "UUID-001", time.monotonic() - 5, {"input": "Hello"}))
     response_queues = [Queue()]
+    request_evicted_status = {}
 
     # Run the loop in a separate thread to allow it to be stopped
     loop_thread = threading.Thread(
-        target=run_streaming_loop, args=(lit_api, None, request_queue, response_queues, NOOP_CB_RUNNER)
+        target=run_streaming_loop,
+        args=(lit_api, None, request_queue, response_queues, request_evicted_status, NOOP_CB_RUNNER),
     )
     loop_thread.start()
 

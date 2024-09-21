@@ -89,7 +89,7 @@ async def response_queue_to_buffer(
                 await asyncio.sleep(0.0001)
                 continue
             stream_response_buffer, event = response_buffer[uid]
-            stream_response_buffer.append(response)
+            stream_response_buffer.append((uid, response))
             event.set()
 
     else:
@@ -206,6 +206,7 @@ class LitServer:
         manager = mp.Manager()
         self.workers_setup_status = manager.dict()
         self.request_queue = manager.Queue()
+        self.request_evicted_status = manager.dict()
 
         self.response_queues = [manager.Queue() for _ in range(num_uvicorn_servers)]
 
@@ -237,6 +238,7 @@ class LitServer:
                     self.batch_timeout,
                     self.stream,
                     self.workers_setup_status,
+                    self.request_evicted_status,
                     self._callback_runner,
                 ),
             )
@@ -272,26 +274,32 @@ class LitServer:
         return [f"{accelerator}:{device}"]
 
     async def data_streamer(self, q: deque, data_available: asyncio.Event, send_status: bool = False):
+        uid = None
         while True:
-            await data_available.wait()
-            while len(q) > 0:
-                data, status = q.popleft()
-                if status == LitAPIStatus.FINISH_STREAMING:
-                    return
-
-                if status == LitAPIStatus.ERROR:
-                    logger.error(
-                        "Error occurred while streaming outputs from the inference worker. "
-                        "Please check the above traceback."
-                    )
+            try:
+                await data_available.wait()
+                while len(q) > 0:
+                    uid, (data, status) = q.popleft()
+                    if status == LitAPIStatus.FINISH_STREAMING:
+                        return
+                    if status == LitAPIStatus.ERROR:
+                        logger.error(
+                            "Error occurred while streaming outputs from the inference worker. "
+                            "Please check the above traceback."
+                        )
+                        if send_status:
+                            yield data, status
+                        return
                     if send_status:
                         yield data, status
-                    return
-                if send_status:
-                    yield data, status
-                else:
-                    yield data
-            data_available.clear()
+                    else:
+                        yield data
+                data_available.clear()
+            except asyncio.CancelledError:
+                if uid is not None:
+                    self.request_evicted_status[uid] = True
+                    logger.exception("Streaming request cancelled for the uid=%s", uid)
+                return
 
     def register_endpoints(self):
         """Register endpoint routes for the FastAPI app and setup middlewares."""
