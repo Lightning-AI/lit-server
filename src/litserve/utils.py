@@ -71,6 +71,7 @@ def wrap_litserve_start(server: "LitServer"):
     yield server
     for p in processes:
         p.terminate()
+    server._transport.close()
     manager.shutdown()
 
 
